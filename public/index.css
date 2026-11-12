@@ -34,3 +34,24 @@ me-main > me-wrapper {
 .map-canvas p {
   margin: 0;
 }
+
+/* Tables and code blocks: no 35em width cap (Mind Elixir default), show them whole */
+.map-container me-tpc:has(table),
+.map-container me-tpc:has(pre) {
+  max-width: none;
+}
+.map-canvas me-tpc table {
+  border-collapse: collapse;
+  white-space: normal;
+}
+.map-canvas me-tpc th,
+.map-canvas me-tpc td {
+  min-width: 6em;
+  max-width: 40em;
+  padding: 4px 10px;
+  vertical-align: top;
+  text-align: left;
+}
+.map-canvas me-tpc pre {
+  white-space: pre;
+}
