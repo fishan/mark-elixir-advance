@@ -1,189 +1,8 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import remarkParse from 'remark-parse';
-import remarkFrontmatter from 'remark-frontmatter';
-import remarkGfm from 'remark-gfm';
-import remarkRehype from 'remark-rehype';
-import rehypeHighlight from 'rehype-highlight';
-import rehypeStringify from 'rehype-stringify';
-import { unified } from 'unified';
 import { MindElixirPanel } from './panel';
-import type { Heading, List, Paragraph, RootContent, Yaml } from 'mdast';
-import type { Root } from 'hast';
-import { NodeObj } from 'mind-elixir';
-import { plaintextToMindElixir, mindElixirToPlaintext } from 'mind-elixir/plaintextConverter';
-import type { Plugin } from 'unified';
-import { visit } from 'unist-util-visit';
-
-interface TreeItem {
-  children: TreeItem[];
-  object: any;
-  parent: TreeItem | null;
-  type: string;
-}
-
-function generateId(): string {
-  return Math.random().toString(36).substring(2, 11);
-}
-
-function extractText(node: any): string {
-  if (!node) return '';
-  if (typeof node.value === 'string') return node.value;
-  if (node.children) {
-    return node.children.map(extractText).join('');
-  }
-  return '';
-}
-
-const parseFrontmatter = (frontmatter: string) => {
-  const data = frontmatter
-    .split('\n')
-    .map((line) => line.split(':').map((item) => item.trim()));
-  return Object.fromEntries(data);
-};
-
-const markdownAstToTree = (ast: any): TreeItem => {
-  const children = ast.children || ast;
-  const treeItem: TreeItem = {
-    type: 'root',
-    children: [],
-    object: ast,
-    parent: null,
-  };
-
-  let current = treeItem;
-  for (let i = 0; i < children.length; i++) {
-    const child = children[i];
-    if (!child) continue;
-    if (child.type === 'yaml' || child.type === 'thematicBreak') {
-      continue;
-    }
-    if (child.type === 'heading') {
-      const heading = child as Heading;
-      const data: TreeItem = {
-        type: heading.type,
-        object: heading,
-        parent: current,
-        children: [],
-      };
-
-      if (heading.depth > (current.object.depth || 0)) {
-        current.children.push(data);
-        current = data;
-      } else {
-        while (
-          heading.depth <= (current.object.depth || 0) &&
-          current.parent
-        ) {
-          current = current.parent;
-        }
-        current.children.push(data);
-        current = data;
-      }
-    } else {
-      const data: TreeItem = {
-        type: child.type,
-        object: child,
-        parent: current,
-        children: [],
-      };
-      current.children.push(data);
-    }
-  }
-
-  return treeItem;
-};
-
-const addWidthAndHeight: Plugin<[], Root> = () =>
-  function transformer(tree) {
-    visit(tree, 'element', function visitor(node) {
-      if (node.tagName === 'img') {
-        node.properties.width = 200;
-        node.properties.height = 100;
-      }
-    });
-  };
-
-const htmlProcessor = unified()
-  .use(remarkRehype)
-  .use(rehypeHighlight)
-  .use(addWidthAndHeight)
-  .use(rehypeStringify);
-
-const processList = (list: List): NodeObj[] => {
-  return list.children.map((listItem) => {
-    const result: NodeObj = {
-      topic: '',
-      id: generateId(),
-      children: [],
-    };
-
-    const contentNode = listItem.children[0];
-    const nestedList = listItem.children[1];
-
-    if (contentNode) {
-      try {
-        const hastNode = htmlProcessor.runSync(contentNode as any);
-        const htmlStr = htmlProcessor.stringify(hastNode);
-        if (typeof htmlStr === 'string') {
-          result.dangerouslySetInnerHTML = htmlStr;
-        }
-      } catch (e) {
-        console.error('HTML conversion error', e);
-      }
-    }
-
-    if (nestedList && nestedList.type === 'list') {
-      result.children = processList(nestedList);
-    }
-
-    return result;
-  });
-};
-
-const treeToMindElixir = (items: TreeItem[]): NodeObj[] => {
-  const nodes: NodeObj[] = [];
-  if (items.length === 1 && items[0].type === 'list') {
-    return processList(items[0].object as List);
-  }
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    const node = {} as NodeObj;
-    nodes.push(node);
-    if (item.type === 'list') {
-      node.children = processList(item.object as List);
-      node.topic = 'List';
-      continue;
-    } else {
-      if (item.type === 'html') {
-        node.dangerouslySetInnerHTML = (item.object as any).value;
-      } else {
-        try {
-          const hastNode = htmlProcessor.runSync(item.object as any);
-          const htmlStr = htmlProcessor.stringify(hastNode);
-          if (typeof htmlStr === 'string') {
-            node.dangerouslySetInnerHTML = htmlStr;
-          }
-        } catch (e) {
-          console.error('HTML conversion error', e);
-        }
-      }
-    }
-
-    // Generate ID
-    node.id = item.object.position?.start?.offset?.toString() || generateId();
-
-    // KEY FEATURE: Merge following lists into preceding content
-    const next = items[i + 1];
-    if (next && next.type === 'list') {
-      node.children = processList(next.object as List);
-      items.splice(i + 1, 1);
-    } else {
-      node.children = treeToMindElixir(item.children);
-    }
-  }
-  return nodes;
-};
+import { markdownToMindElixirData, type ConvertIssue, type ConvertResult } from './markdownConverter';
+import { applyMapOp, type MapOp } from './sourceEdits';
 
 /**
  * Get mind-elixir locale from VS Code language setting.
@@ -204,6 +23,14 @@ function getMindElixirLocale(): string {
   return 'en';
 }
 
+/**
+ * Opens a Markdown file as an editable mind map.
+ *
+ * The file is the single source of truth: every map operation is translated
+ * into a minimal text edit of the affected lines only (`sourceEdits.ts`), and
+ * the map is then re-rendered from the file. Nothing else in the file is
+ * rewritten.
+ */
 export const markdownToMindElixir = (context: vscode.ExtensionContext) => {
   return async () => {
     const editor = vscode.window.activeTextEditor;
@@ -213,109 +40,107 @@ export const markdownToMindElixir = (context: vscode.ExtensionContext) => {
       return;
     }
     const document = editor.document;
-    const documentContent = document.getText();
+    const editorColumn = editor.viewColumn;
     const locale = getMindElixirLocale();
+    const fileTitle = path.basename(document.fileName, path.extname(document.fileName));
 
-    // Detect Mind Elixir Plaintext format (starts with "- ")
-    const isPlaintext = documentContent.trimStart().startsWith('- ');
+    const diagnostics = vscode.languages.createDiagnosticCollection('mark-elixir');
 
-    const getParsedData = (text: string) => {
-      let data: NodeObj;
-      let title = path.basename(document.fileName, path.extname(document.fileName));
-
-      if (isPlaintext) {
-        // Use plaintextToMindElixir converter for Plaintext format
-        const mindElixirData = plaintextToMindElixir(text, title);
-        data = mindElixirData.nodeData;
-      } else {
-        // Parse as Markdown
-        const ast = unified()
-          .use(remarkParse)
-          .use(remarkFrontmatter)
-          .use(remarkGfm)
-          .parse(text);
-
-        const frontmatter = ast.children.find((child) => child.type === 'yaml');
-
-        // Get configuration value
-        const config = vscode.workspace.getConfiguration('mindElixirMarkdown');
-        const useH1AsRoot = config.get('h1AsRoot');
-
-        if (frontmatter) {
-          const obj = parseFrontmatter((frontmatter as Yaml).value);
-          if (obj.title) {
-            title = obj.title;
-          }
-        }
-
-        // Convert ast to hierarchical tree
-        const tree = markdownAstToTree(ast);
-
-        let nodes: NodeObj[];
-        let rootTopic = title;
-
-        if (useH1AsRoot) {
-          const h1Index = tree.children.findIndex(
-            (child) => child.type === 'heading' && (child.object as Heading).depth === 1
-          );
-          if (h1Index !== -1) {
-            const h1 = tree.children[h1Index];
-            rootTopic = extractText(h1.object);
-            nodes = treeToMindElixir(h1.children);
-          } else {
-            nodes = treeToMindElixir(tree.children);
-          }
-        } else {
-          nodes = treeToMindElixir(tree.children);
-        }
-
-        data = {
-          topic: rootTopic,
-          id: 'root',
-          children: nodes,
-        };
-      }
-      return { data, title };
+    const reportIssues = (issues: ConvertIssue[]) => {
+      diagnostics.set(
+        document.uri,
+        issues.map((issue) => {
+          const r = issue.range;
+          const range = r
+            ? new vscode.Range(r.startLine - 1, r.startColumn - 1, r.endLine - 1, r.endColumn - 1)
+            : new vscode.Range(0, 0, 0, 0);
+          const d = new vscode.Diagnostic(range, issue.message, vscode.DiagnosticSeverity.Warning);
+          d.source = 'Mark Elixir';
+          return d;
+        })
+      );
     };
 
-    const parsed = getParsedData(documentContent);
-    const data = parsed.data;
-    const title = parsed.title;
+    // Latest parse of the document (+ the version it belongs to)
+    let parsed: ConvertResult;
+    let parsedVersion = -1;
+    const parse = (): ConvertResult => {
+      if (parsedVersion !== document.version) {
+        const config = vscode.workspace.getConfiguration('mindElixirMarkdown');
+        parsed = markdownToMindElixirData(document.getText(), {
+          title: fileTitle,
+          h1AsRoot: config.get<boolean>('h1AsRoot', true),
+        });
+        parsedVersion = document.version;
+        reportIssues(parsed.issues);
+      }
+      return parsed;
+    };
 
+    const first = parse();
     const mindElixirPanel = new MindElixirPanel(
       context.extensionUri,
-      title + ' - Mark Elixir',
-      isPlaintext,
+      first.title + ' - Mark Elixir',
       locale
     );
+    await mindElixirPanel.init(first.data);
 
-    await mindElixirPanel.init(data);
+    const postData = () => {
+      try {
+        void mindElixirPanel.panel.webview.postMessage({ command: 'updateData', data: parse().data });
+      } catch (err) {
+        console.error('Error updating mind map data:', err);
+      }
+    };
 
-    let isUpdatingFromWebview = false;
+    /** Apply one map operation to the document. On failure re-sync the map from the file. */
+    const handleOp = async (op: MapOp) => {
+      const result = applyMapOp(parse().source, op);
+      if ('error' in result) {
+        vscode.window.showWarningMessage(`Mark Elixir: ${result.error} The map was reloaded from the file.`);
+        postData();
+        return;
+      }
+      if (result.edits.length === 0) return;
+      const wasDirty = document.isDirty;
+      const edit = new vscode.WorkspaceEdit();
+      for (const e of result.edits) {
+        edit.replace(
+          document.uri,
+          new vscode.Range(document.positionAt(e.start), document.positionAt(e.end)),
+          e.text
+        );
+      }
+      const ok = await vscode.workspace.applyEdit(edit);
+      if (!ok) {
+        vscode.window.showErrorMessage('Mark Elixir: could not apply the change to the file.');
+        postData();
+        return;
+      }
+      if (!wasDirty) await document.save();
+    };
 
-    // Handle messages from webview
-    mindElixirPanel.panel.webview.onDidReceiveMessage(async (message: any) => {
+    /** Run undo / redo in the source editor, then return focus to the map. */
+    const runInEditor = async (command: 'undo' | 'redo') => {
+      await vscode.window.showTextDocument(document, { viewColumn: editorColumn, preserveFocus: false });
+      await vscode.commands.executeCommand(command);
+      mindElixirPanel.panel.reveal(undefined, false);
+    };
+
+    // Operations are applied strictly one after another
+    let queue: Promise<void> = Promise.resolve();
+    mindElixirPanel.panel.webview.onDidReceiveMessage((message: any) => {
       switch (message.command) {
-        case 'save': {
-          // Plaintext bidirectional editing: write mind map data back to file
-          if (!isPlaintext) return;
-          try {
-            isUpdatingFromWebview = true;
-            const plaintext = mindElixirToPlaintext(message.data);
-            const encoder = new TextEncoder();
-            await vscode.workspace.fs.writeFile(
-              document.uri,
-              encoder.encode(plaintext)
-            );
-            setTimeout(() => {
-              isUpdatingFromWebview = false;
-            }, 500);
-          } catch (e) {
-            vscode.window.showErrorMessage(`Mark Elixir: failed to save file: ${e}`);
-            isUpdatingFromWebview = false;
-          }
+        case 'op':
+          queue = queue.then(() => handleOp(message.op as MapOp)).catch((e) => {
+            vscode.window.showErrorMessage(`Mark Elixir: failed to update file: ${e}`);
+            postData();
+          });
           return;
-        }
+        case 'undo':
+        case 'redo':
+          queue = queue.then(() => runInEditor(message.command)).catch(() => undefined);
+          return;
         default:
           break;
       }
@@ -324,32 +149,15 @@ export const markdownToMindElixir = (context: vscode.ExtensionContext) => {
     let updateTimer: NodeJS.Timeout | null = null;
 
     const changeDocumentSubscription = vscode.workspace.onDidChangeTextDocument((e) => {
-      if (e.document.uri.toString() === document.uri.toString()) {
-        if (isUpdatingFromWebview) return;
-        
-        if (updateTimer) {
-          clearTimeout(updateTimer);
-        }
-        updateTimer = setTimeout(() => {
-          try {
-            const updatedText = e.document.getText();
-            const { data: updatedData } = getParsedData(updatedText);
-            mindElixirPanel.panel.webview.postMessage({
-              command: 'updateData',
-              data: updatedData,
-            });
-          } catch (err) {
-            console.error('Error updating mind map data:', err);
-          }
-        }, 300); // debounce 300ms
-      }
+      if (e.document.uri.toString() !== document.uri.toString()) return;
+      if (updateTimer) clearTimeout(updateTimer);
+      updateTimer = setTimeout(postData, 300); // debounce 300ms
     });
 
     mindElixirPanel.panel.onDidDispose(() => {
       changeDocumentSubscription.dispose();
-      if (updateTimer) {
-        clearTimeout(updateTimer);
-      }
+      diagnostics.dispose();
+      if (updateTimer) clearTimeout(updateTimer);
     });
 
     context.subscriptions.push(mindElixirPanel.panel, changeDocumentSubscription);

@@ -5,7 +5,7 @@
   "publisher": "MindElixir",
   "repository": "https://github.com/SSShooter/mark-elixir",
   "description": "Check markdown file as a Mind Map.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -48,7 +48,7 @@
         "mindElixirMarkdown.h1AsRoot": {
           "type": "boolean",
           "default": true,
-          "description": "If there is exactly one top-level heading (h1), use it as the root node instead of the file name"
+          "description": "Use the top-level heading (h1) — or, for a document that is a single list, its only top-level item — as the root node instead of the file name"
         }
       }
     }

@@ -6,6 +6,16 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-12
+- Links (arrows) between nodes: node IDs via `{#id}` / `[^id]`, links via `> [^a] >-label-> [^b]` or `<!-- mindmap:link from=a to=b -->`; one-way / two-way, labels and saved curves.
+- The map is always editable: add, rename, delete and move nodes, create links. Each map change edits only the affected lines of the Markdown file (heading levels and list indentation are adjusted on move).
+- Link context menu (edit label, one-way / two-way, reset curve, delete) and dragging a link's line to bend it.
+- Unknown / duplicate link IDs are reported in the Problems panel.
+- `Ctrl+Z` / `Ctrl+Y` on the map undo / redo in the text editor.
+- Fix: a Markdown file starting with a list was treated as Mind Elixir plaintext and the whole file was rewritten on any map change (tables and other content were lost). The separate plaintext mode is removed; plaintext files are parsed as Markdown.
+- Fix: arrows in plaintext files were dropped when the map was opened.
+- Escape map data embedded into the webview `<script>`.
+
 ## [1.1.0] - 2026-05-22
 - Implement markdown-it plugin to render MindElixir mindmaps directly inside VSCode standard markdown previews (e.g. using `mindmap` code blocks).
 - Integrate KaTeX `mhchem` extension for high-quality chemical formula rendering.

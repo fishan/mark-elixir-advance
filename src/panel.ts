@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { getFileContentAsString, saveFile } from './utils';
-import { NodeObj } from 'mind-elixir';
+import type { MindElixirData } from 'mind-elixir';
 
 export class MindElixirPanel {
   panel: vscode.WebviewPanel;
@@ -8,7 +8,6 @@ export class MindElixirPanel {
   constructor(
     private readonly _extensionUri: vscode.Uri,
     name: string,
-    private readonly isPlaintext: boolean = false,
     private readonly locale: string = 'en',
   ) {
     const panel = vscode.window.createWebviewPanel(
@@ -23,8 +22,8 @@ export class MindElixirPanel {
     );
     this.panel = panel;
   }
-  async init(nodeData: NodeObj) {
-    this.html = await this.getWebviewContent(nodeData);
+  async init(data: MindElixirData) {
+    this.html = await this.getWebviewContent(data);
     this.panel.webview.html = this.html;
 
     this.panel.webview.onDidReceiveMessage((message: any) => {
@@ -38,7 +37,7 @@ export class MindElixirPanel {
   async download() {
     saveFile(this.html!);
   }
-  getWebviewContent = async (nodeData: NodeObj) => {
+  getWebviewContent = async (data: MindElixirData) => {
     const js = await getFileContentAsString(
       vscode.Uri.joinPath(this._extensionUri, 'dist', 'webview.js')
     );
@@ -65,10 +64,9 @@ export class MindElixirPanel {
             <div id="map"></div>
             <script>
               window.injectedData = ${JSON.stringify({
-                nodeData,
-                isPlaintext: this.isPlaintext,
+                data,
                 locale: this.locale,
-              })};
+              }).replace(/</g, '\\u003c')};
               ${js}
             </script>
         </body>

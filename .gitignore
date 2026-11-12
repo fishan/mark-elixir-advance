@@ -7,3 +7,4 @@ node_modules
 .vsce-token
 .ovsx-token
 
+.chronicles/

@@ -6,6 +6,7 @@ import type {
   MindElixirData,
   MindElixirInstance,
   NodeObj,
+  ArrowSvg,
   Options,
 } from 'mind-elixir';
 import * as mindElixirI18n from 'mind-elixir/i18n';
@@ -15,8 +16,8 @@ import 'katex/contrib/mhchem';
 
 
 interface InjectedData {
-  nodeData: NodeObj;
-  isPlaintext?: boolean;
+  /** Full map: nodes plus arrows (links between nodes) */
+  data: MindElixirData;
   locale?: string;
 }
 
@@ -76,62 +77,310 @@ const setExpandedAll = (data: NodeObj, expanded: boolean) => {
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 const injected: InjectedData = window.injectedData;
-const isPlaintext = injected.isPlaintext ?? false;
 const langPack = resolveLocale(injected.locale);
+const isRu = injected.locale === 'ru';
+const tr = (en: string, ru: string) => (isRu ? ru : en);
 
-let data: MindElixirData = { nodeData: injected.nodeData };
+const data: MindElixirData = injected.data;
 let mind: MindElixirInstance | null = null;
 
-// Throttle timer for plaintext save
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
+const escapeHtml = (s: string) =>
+  s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
+
+/**
+ * Node topics hold the Markdown *source* (that is what the user edits); the
+ * extension also sends the rendered HTML in `metadata.html`. Show the HTML
+ * while the topic is unchanged, plain text right after an edit (until the
+ * file round-trip brings fresh HTML).
+ */
+const renderTopic = (text: string, obj?: any): string => {
+  const meta = obj?.metadata;
+  if (meta && typeof meta.html === 'string' && meta.src === text) return renderMath(meta.html);
+  return renderMath(escapeHtml(text ?? ''));
+};
 
 const options: Options = {
   el: '#map',
   direction: MindElixir.RIGHT,
   draggable: true,
-  editable: isPlaintext,
+  editable: true,
   contextMenu: { locale: langPack },
   toolBar: true,
-  keypress: isPlaintext,
-  allowUndo: isPlaintext,
+  keypress: true,
+  // Undo/redo is done in the text editor (the file is the source of truth)
+  allowUndo: false,
   theme: MindElixir.DARK_THEME,
-  // Render KaTeX math formulas in node topics
-  markdown: (str: string) => renderMath(str),
+  markdown: renderTopic,
 };
 
 mind = new MindElixir(options);
 mind.init(data);
+const me = mind as MindElixirInstance & Record<string, any>;
 
-// ─── Plaintext Bidirectional Editing ─────────────────────────────────────────
-if (isPlaintext && vsc) {
-  // Listen to mind map operations and throttle save messages back to extension
-  mind.bus.addListener('operation', () => {
-    if (saveTimer) return;
-    saveTimer = setTimeout(() => {
-      if (mind) {
-        vsc.postMessage({
-          command: 'save',
-          data: mind.getData(),
-        });
-      }
-      saveTimer = null;
-    }, 1000);
-  });
+// ─── Map operations → extension (targeted edits of the Markdown file) ───────
+const send = (op: Record<string, unknown>) => vsc?.postMessage({ command: 'op', op });
 
-  // Also throttle arrow movement saves
-  mind.bus.addListener('updateArrowDelta', () => {
-    if (saveTimer) return;
-    saveTimer = setTimeout(() => {
-      if (mind) {
-        vsc.postMessage({
-          command: 'save',
-          data: mind.getData(),
-        });
-      }
-      saveTimer = null;
-    }, 2000);
+const walk = (n: NodeObj, fn: (n: NodeObj) => void) => {
+  fn(n);
+  n.children?.forEach((c) => walk(c, fn));
+};
+const nodeById = (id: string): NodeObj | undefined => {
+  let found: NodeObj | undefined;
+  if (mind) walk(mind.nodeData, (n) => (n.id === id ? (found = n) : undefined));
+  return found;
+};
+/** Child indexes from the root (valid in the current map state). */
+const pathOf = (node: NodeObj): number[] | undefined => {
+  const path: number[] = [];
+  let cur: any = node;
+  while (cur.parent) {
+    const i = cur.parent.children?.indexOf(cur) ?? -1;
+    if (i < 0) return undefined;
+    path.unshift(i);
+    cur = cur.parent;
+  }
+  return path;
+};
+const ref = (n: NodeObj) => ({ id: n.id, path: pathOf(n) });
+
+mind.bus.addListener('operation', (op: any) => {
+  switch (op.name) {
+    case 'addChild':
+    case 'insertSibling': {
+      const n: any = op.obj;
+      const p = n.parent;
+      if (!p) return;
+      send({ type: 'insert', parent: ref(p), index: p.children.indexOf(n), topic: n.topic });
+      break;
+    }
+    case 'finishEdit':
+      send({ type: 'edit', node: ref(op.obj), topic: op.obj.topic });
+      break;
+    case 'removeNodes':
+      send({ type: 'remove', ids: op.objs.map((o: NodeObj) => o.id) });
+      break;
+    case 'moveUpNode':
+    case 'moveDownNode':
+    case 'moveNodeIn':
+    case 'moveNodeBefore':
+    case 'moveNodeAfter': {
+      const objs: any[] = op.objs ?? [op.obj];
+      const p = objs[0]?.parent;
+      if (!p) return;
+      const moved = new Set(objs.map((o) => o.id));
+      const kids: NodeObj[] = p.children ?? [];
+      const first = kids.findIndex((k) => moved.has(k.id));
+      const index = kids.slice(0, first).filter((k) => !moved.has(k.id)).length;
+      send({ type: 'move', ids: objs.map((o) => o.id), parent: { id: p.id }, index });
+      break;
+    }
+    case 'createArrow': {
+      const a = op.obj;
+      const from = nodeById(a.from);
+      const to = nodeById(a.to);
+      if (!from || !to) return;
+      send({ type: 'createArrow', from: ref(from), to: ref(to), label: a.label ?? '', bidirectional: !!a.bidirectional });
+      break;
+    }
+    case 'removeArrow':
+      send({ type: 'removeArrow', id: op.obj.id });
+      break;
+    case 'finishEditArrowLabel':
+      send({ type: 'updateArrow', id: op.obj.id, label: op.obj.label });
+      break;
+    case 'insertParent':
+    case 'copyNode':
+    case 'copyNodes':
+    case 'createSummary':
+    case 'removeSummary':
+    case 'finishEditSummary':
+    case 'reshapeNode':
+      send({ type: 'unsupported', name: op.name });
+      break;
+    default:
+      // beginEdit, expand / collapse … — view state only, nothing to write
+      break;
+  }
+});
+
+// Curve changed with the control-point handles: write it once the user stops
+const deltaTimers = new Map<string, ReturnType<typeof setTimeout>>();
+mind.bus.addListener('updateArrowDelta', (arrow: any) => {
+  clearTimeout(deltaTimers.get(arrow.id));
+  deltaTimers.set(
+    arrow.id,
+    setTimeout(() => {
+      deltaTimers.delete(arrow.id);
+      send({ type: 'updateArrow', id: arrow.id, delta1: arrow.delta1, delta2: arrow.delta2 });
+    }, 500)
+  );
+});
+
+// Ctrl+Z / Ctrl+Y on the map → undo / redo in the Markdown editor
+window.addEventListener(
+  'keydown',
+  (e) => {
+    if ((e.target as HTMLElement)?.id === 'input-box' || !(e.ctrlKey || e.metaKey)) return;
+    const k = e.key.toLowerCase();
+    const command = k === 'z' && !e.shiftKey ? 'undo' : k === 'y' || (k === 'z' && e.shiftKey) ? 'redo' : '';
+    if (!command) return;
+    e.preventDefault();
+    e.stopPropagation();
+    vsc?.postMessage({ command });
+  },
+  true
+);
+
+// ─── Arrow context menu & drag-to-bend ───────────────────────────────────────
+type ArrowG = ArrowSvg & { arrowObj: any };
+const mapEl = document.getElementById('map')!;
+
+const style = document.createElement('style');
+style.textContent = `
+.me-arrow-menu{position:fixed;z-index:1000;min-width:190px;padding:4px 0;
+  background:var(--vscode-menu-background,#252526);color:var(--vscode-menu-foreground,#ccc);
+  border:1px solid var(--vscode-menu-border,#454545);border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.45);
+  font:13px var(--vscode-font-family,sans-serif);user-select:none}
+.me-arrow-menu .item{padding:6px 14px;cursor:pointer;white-space:nowrap}
+.me-arrow-menu .item:hover{background:var(--vscode-menu-selectionBackground,#04395e);color:var(--vscode-menu-selectionForeground,#fff)}
+.me-arrow-menu .danger{color:var(--vscode-errorForeground,#f48771)}
+.me-arrow-menu .sep{height:1px;margin:4px 0;background:var(--vscode-menu-separatorBackground,#454545)}
+#map g[data-linkid] path{cursor:grab}
+#map.me-arrow-dragging, #map.me-arrow-dragging *{cursor:grabbing !important}
+`;
+document.head.appendChild(style);
+
+const menu = document.createElement('div');
+menu.className = 'me-arrow-menu';
+menu.hidden = true;
+document.body.appendChild(menu);
+const hideMenu = () => (menu.hidden = true);
+
+const findArrowG = (id: string) =>
+  me.container.querySelector(`g[data-linkid="${CSS.escape(id)}"]`) as ArrowG | null;
+const arrowFromTarget = (target: EventTarget | null): ArrowG | null => {
+  if (!(target instanceof Element)) return null;
+  const g = target.closest('g[data-linkid]') as ArrowG | null;
+  if (g) return g;
+  const label = target.closest('.svg-label[data-type="arrow"]') as HTMLElement | null;
+  const svgId = label?.dataset.svgId;
+  return svgId ? (document.getElementById(svgId) as unknown as ArrowG) : null;
+};
+const selectArrow = (g: ArrowG) => {
+  me.clearSelection();
+  me.selectArrow(g);
+};
+
+function showArrowMenu(g: ArrowG, x: number, y: number) {
+  const a = g.arrowObj;
+  menu.innerHTML = '';
+  const item = (label: string, fn: () => void, cls = '') => {
+    const el = document.createElement('div');
+    el.className = 'item ' + cls;
+    el.textContent = label;
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      hideMenu();
+      fn();
+    });
+    menu.appendChild(el);
+  };
+  const sep = () => menu.appendChild(Object.assign(document.createElement('div'), { className: 'sep' }));
+
+  item(tr('Edit label', 'Изменить подпись'), () => me.editArrowLabel(findArrowG(a.id) ?? g));
+  item(
+    a.bidirectional ? tr('Make one-way', 'Сделать односторонней') : tr('Make two-way', 'Сделать двусторонней'),
+    () => {
+      a.bidirectional = !a.bidirectional;
+      me.renderArrow();
+      send({ type: 'updateArrow', id: a.id, bidirectional: a.bidirectional });
+    }
+  );
+  item(tr('Reset curve', 'Сбросить изгиб'), () => {
+    delete a.delta1;
+    delete a.delta2;
+    me.renderArrow();
+    send({ type: 'updateArrow', id: a.id, resetDeltas: true });
   });
+  sep();
+  item(tr('Delete link', 'Удалить связь'), () => me.removeArrow(findArrowG(a.id) ?? g), 'danger');
+
+  menu.hidden = false;
+  const r = menu.getBoundingClientRect();
+  menu.style.left = Math.min(x, window.innerWidth - r.width - 4) + 'px';
+  menu.style.top = Math.min(y, window.innerHeight - r.height - 4) + 'px';
 }
+
+// Capture phase on #map: runs before Mind Elixir's own handlers on the container
+mapEl.addEventListener(
+  'contextmenu',
+  (e) => {
+    const g = arrowFromTarget(e.target);
+    if (!g) return;
+    e.preventDefault();
+    e.stopPropagation();
+    selectArrow(g);
+    showArrowMenu(g, e.clientX, e.clientY);
+  },
+  true
+);
+
+let drag: null | {
+  a: any;
+  id: string;
+  x: number;
+  y: number;
+  d1: { x: number; y: number };
+  d2: { x: number; y: number };
+  moved: boolean;
+} = null;
+
+// Drag the arrow line itself: both control points move together → the curve bends.
+// (Labels keep Mind Elixir's behaviour: click selects, double-click edits.)
+mapEl.addEventListener(
+  'pointerdown',
+  (e) => {
+    if (!menu.hidden && !menu.contains(e.target as Node)) hideMenu();
+    const g = e.target instanceof Element ? (e.target.closest('g[data-linkid]') as ArrowG | null) : null;
+    if (!g) return;
+    e.stopPropagation(); // no panning / box selection
+    if (e.button !== 0) return;
+    e.preventDefault();
+    selectArrow(g);
+    const a = g.arrowObj;
+    if (!a.delta1 || !a.delta2) return;
+    drag = { a, id: a.id, x: e.clientX, y: e.clientY, d1: { ...a.delta1 }, d2: { ...a.delta2 }, moved: false };
+  },
+  true
+);
+window.addEventListener('pointermove', (e) => {
+  if (!drag) return;
+  const scale = me.scaleVal || 1;
+  const dx = (e.clientX - drag.x) / scale;
+  const dy = (e.clientY - drag.y) / scale;
+  if (!drag.moved && Math.abs(dx) + Math.abs(dy) < 3) return;
+  if (!drag.moved) {
+    drag.moved = true;
+    me.unselectArrow();
+    mapEl.classList.add('me-arrow-dragging');
+  }
+  drag.a.delta1 = { x: Math.round(drag.d1.x + dx), y: Math.round(drag.d1.y + dy) };
+  drag.a.delta2 = { x: Math.round(drag.d2.x + dx), y: Math.round(drag.d2.y + dy) };
+  me.renderArrow();
+});
+window.addEventListener('pointerup', () => {
+  if (!drag) return;
+  const d = drag;
+  drag = null;
+  mapEl.classList.remove('me-arrow-dragging');
+  if (!d.moved) return;
+  const g = findArrowG(d.id);
+  if (g) selectArrow(g);
+  send({ type: 'updateArrow', id: d.id, delta1: d.a.delta1, delta2: d.a.delta2 });
+});
+window.addEventListener('keydown', (e) => e.key === 'Escape' && hideMenu());
+window.addEventListener('blur', hideMenu);
+mapEl.addEventListener('wheel', hideMenu, { passive: true });
 
 // ─── Toolbar Buttons ──────────────────────────────────────────────────────────
 const toolBar = document.querySelector('.mind-elixir-toolbar.rb');
@@ -187,15 +436,31 @@ if (vsc) {
   toolBar?.appendChild(downloadHtmlBtn);
 }
 
-// Listen for updates from the extension
-window.addEventListener('message', event => {
+// ─── Updates from the extension (the file changed) ───────────────────────────
+// Deferred while the user is typing in a node / dragging, so the edit box is
+// not destroyed under their cursor. Collapsed branches stay collapsed.
+let pending: MindElixirData | null = null;
+const isBusy = () => !!document.getElementById('input-box') || !!drag || deltaTimers.size > 0;
+const applyPending = () => {
+  if (!pending || !mind) return;
+  if (isBusy()) {
+    setTimeout(applyPending, 200);
+    return;
+  }
+  const next = pending;
+  pending = null;
+  const collapsed = new Set<string>();
+  walk(mind.nodeData, (n) => (n.expanded === false ? collapsed.add(n.id) : undefined));
+  walk(next.nodeData, (n) => (collapsed.has(n.id) ? (n.expanded = false) : undefined));
+  mind.refresh(next);
+};
+
+window.addEventListener('message', (event) => {
   const message = event.data;
   switch (message.command) {
     case 'updateData':
-      if (mind) {
-        mind.nodeData = message.data;
-        mind.refresh();
-      }
+      pending = message.data as MindElixirData;
+      applyPending();
       break;
   }
 });
