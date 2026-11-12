@@ -60,7 +60,7 @@ export interface ConvertOptions {
   h1AsRoot: boolean;
 }
 
-export type SourceKind = 'root' | 'heading' | 'listItem' | 'block' | 'listGroup';
+export type SourceKind = 'root' | 'heading' | 'listItem' | 'block';
 
 /** Where a map node lives in the document. All offsets are 0-based. */
 export interface SourceInfo {
@@ -109,10 +109,34 @@ export interface LinkSource {
   delta2?: { x: number; y: number };
 }
 
+/** A summary ("Описание") bracket over consecutive siblings. */
+export interface SummarySource {
+  /** id of the produced summary (absent when it could not be resolved) */
+  summaryId?: string;
+  /** comment: `<!-- mindmap:summary from=a to=b label="x" -->`; item: `- }:2 label` */
+  form: 'comment' | 'item';
+  /** range of the comment / of the `}:2 label` paragraph */
+  nodeStart: number;
+  nodeEnd: number;
+  removeStart: number;
+  removeEnd: number;
+  block: boolean;
+  label: string;
+  from?: string;
+  to?: string;
+  count?: number;
+  /** resolved position (for matching a summary the map created before a re-sync) */
+  parent?: string;
+  start?: number;
+  end?: number;
+  range?: SourceRange;
+}
+
 export interface SourceMap {
   text: string;
   nodes: Map<string, SourceInfo>;
   links: LinkSource[];
+  summaries: SummarySource[];
   /** markdown id → map node id */
   anchors: Map<string, string>;
   /** start offset + depth of every top-level heading */
@@ -143,6 +167,10 @@ const ARROW_LINE_RE = new RegExp(
   'u'
 );
 const LINK_COMMENT_RE = /^<!--\s*mindmap:link\b([\s\S]*?)-->\s*$/;
+/** `<!-- mindmap:node id=x -->` right after a table / code block / image gives it an ID */
+const NODE_COMMENT_RE = /^<!--\s*mindmap:node\b([\s\S]*?)-->\s*$/;
+const SUMMARY_COMMENT_RE = /^<!--\s*mindmap:summary\b([\s\S]*?)-->\s*$/;
+const ID_ONLY_RE = new RegExp(`^${ID}$`, 'u');
 const ATTR_RE = /([\w-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"']+)))?/g;
 const SUMMARY_RE = /^\}(?::(\d+))?\s*(.*)$/s;
 export const LIST_MARKER_RE = /^([ \t]*)([-*+]|\d+[.)])([ \t]+|$)/;
@@ -169,8 +197,21 @@ interface Ctx {
   issues: ConvertIssue[];
   nodes: Map<string, SourceInfo>;
   summaries: Summary[];
+  summarySources: SummarySource[];
+  /** `<!-- mindmap:node id=x -->` comments → id */
+  nodeComments: Map<unknown, string>;
+  /** next top-level mdast sibling */
+  nextOf: Map<unknown, any>;
   headings: { start: number; depth: number; atx: boolean }[];
 }
+
+const parseAttrs = (s: string) => {
+  const attrs: Record<string, string | true> = {};
+  for (const a of Array.from(s.matchAll(ATTR_RE))) {
+    attrs[a[1].toLowerCase()] = a[2] ?? a[3] ?? a[4] ?? true;
+  }
+  return attrs;
+};
 
 export function extractText(node: any): string {
   if (!node) return '';
@@ -348,13 +389,44 @@ function collectLinks(ast: any, ctx: Ctx): void {
       return 'skip';
     }
     if (node.type === 'html') {
-      const m = (node.value as string).trim().match(LINK_COMMENT_RE);
+      const value = (node.value as string).trim();
+      const nm = value.match(NODE_COMMENT_RE);
+      if (nm) {
+        ctx.skip.add(node);
+        const id = parseAttrs(nm[1]).id;
+        if (typeof id === 'string' && ID_ONLY_RE.test(id)) ctx.nodeComments.set(node, id);
+        else ctx.issues.push({ message: 'Mind map: node comment needs id=<id>.', range: rangeOf(node) });
+        return;
+      }
+      const sm = value.match(SUMMARY_COMMENT_RE);
+      if (sm) {
+        ctx.skip.add(node);
+        const attrs = parseAttrs(sm[1]);
+        const block = parent?.type !== 'paragraph';
+        if (typeof attrs.from !== 'string' || typeof attrs.to !== 'string') {
+          ctx.issues.push({
+            message: 'Mind map: summary comment needs both from=<id> and to=<id>.',
+            range: rangeOf(node),
+          });
+          return;
+        }
+        ctx.summarySources.push({
+          form: 'comment',
+          block,
+          nodeStart: startOf(node),
+          nodeEnd: endOf(node),
+          ...removal(block),
+          label: typeof attrs.label === 'string' ? attrs.label : '',
+          from: attrs.from,
+          to: attrs.to,
+          range: rangeOf(node),
+        } as SummarySource);
+        return;
+      }
+      const m = value.match(LINK_COMMENT_RE);
       if (!m) return;
       ctx.skip.add(node);
-      const attrs: Record<string, string | true> = {};
-      for (const a of Array.from(m[1].matchAll(ATTR_RE))) {
-        attrs[a[1].toLowerCase()] = a[2] ?? a[3] ?? a[4] ?? true;
-      }
+      const attrs = parseAttrs(m[1]);
       const from = attrs.from;
       const to = attrs.to;
       if (typeof from !== 'string' || typeof to !== 'string') {
@@ -415,6 +487,34 @@ function resolveLinks(ctx: Ctx): { arrows: Arrow[]; links: LinkSource[] } {
     links.push({ ...rest, arrowId: arrow.id });
   });
   return { arrows, links };
+}
+
+/** Resolve `<!-- mindmap:summary from=a to=b -->` (item-form summaries are resolved while parsing lists). */
+function resolveSummaries(ctx: Ctx): void {
+  for (const s of ctx.summarySources) {
+    if (s.form !== 'comment') continue;
+    const missing = [s.from!, s.to!].filter((id) => !ctx.anchors.has(id));
+    if (missing.length) {
+      ctx.issues.push({
+        message: `Mind map: unknown node ID ${missing.map((id) => `"${id}"`).join(' and ')} in summary.`,
+        range: s.range,
+      });
+      continue;
+    }
+    const a = ctx.nodes.get(ctx.anchors.get(s.from!)!.nodeId);
+    const b = ctx.nodes.get(ctx.anchors.get(s.to!)!.nodeId);
+    const parent = a?.parentId ? ctx.nodes.get(a.parentId) : undefined;
+    if (!a || !b || !parent || a.parentId !== b.parentId) {
+      ctx.issues.push({ message: 'Mind map: a summary must span siblings (nodes with the same parent).', range: s.range });
+      continue;
+    }
+    let start = parent.children.indexOf(a.id);
+    let end = parent.children.indexOf(b.id);
+    if (start > end) [start, end] = [end, start];
+    const id = `summary-${ctx.summaries.length}`;
+    ctx.summaries.push({ id, label: s.label, parent: parent.id, start, end } as Summary);
+    Object.assign(s, { summaryId: id, parent: parent.id, start, end });
+  }
 }
 
 function registerAnchor(ctx: Ctx, id: string, nodeObj: NodeObj, source: MdNode): boolean {
@@ -508,7 +608,8 @@ function fillNode(
   }
 }
 
-function processList(ctx: Ctx, list: List, parent: SourceInfo, path: number[]): NodeObj[] {
+/** `base` = index of the first item among the parent's children (list items may follow other nodes). */
+function processList(ctx: Ctx, list: List, parent: SourceInfo, path: number[], base = 0): NodeObj[] {
   const text = ctx.text;
   const result: NodeObj[] = [];
   for (const listItem of list.children as ListItem[]) {
@@ -520,18 +621,29 @@ function processList(ctx: Ctx, list: List, parent: SourceInfo, path: number[]): 
       const sm = extractText(contentNode).match(SUMMARY_RE);
       if (sm && result.length > 0) {
         const n = sm[1] ? Math.min(Number(sm[1]), result.length) : result.length;
-        ctx.summaries.push({
-          id: `summary-${ctx.summaries.length}`,
+        const id = `summary-${ctx.summaries.length}`;
+        const start = base + result.length - n;
+        const end = base + result.length - 1;
+        ctx.summaries.push({ id, label: sm[2].trim(), parent: parent.id, start, end } as Summary);
+        ctx.summarySources.push({
+          summaryId: id,
+          form: 'item',
+          block: true,
+          nodeStart: startOf(contentNode),
+          nodeEnd: endOf(contentNode),
+          removeStart: lineStart(text, startOf(listItem)),
+          removeEnd: lineEndAfter(text, endOf(listItem)),
           label: sm[2].trim(),
+          count: sm[1] ? Number(sm[1]) : undefined,
           parent: parent.id,
-          start: result.length - n,
-          end: result.length - 1,
-        } as Summary);
+          start,
+          end,
+        });
         continue;
       }
     }
 
-    const childPath = [...path, result.length];
+    const childPath = [...path, base + result.length];
     const ls = lineStart(text, startOf(listItem));
     const mm = text.slice(ls).match(LIST_MARKER_RE);
     const node: NodeObj = { topic: '', id: pathId(childPath), children: [] };
@@ -568,19 +680,21 @@ function sectionEnd(ctx: Ctx, heading: Heading): number {
 
 function treeToMindElixir(ctx: Ctx, items: TreeItem[], parent: SourceInfo, path: number[]): NodeObj[] {
   const text = ctx.text;
-  if (items.length === 1 && items[0].type === 'list') {
-    return processList(ctx, items[0].object as List, parent, path);
-  }
   const nodes: NodeObj[] = [];
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     const md = item.object;
+    if (item.type === 'list') {
+      // List items are direct children of the section (no "List" wrapper node)
+      nodes.push(...processList(ctx, md as List, parent, path, nodes.length));
+      continue;
+    }
     const childPath = [...path, nodes.length];
     const node = { id: pathId(childPath), topic: '', children: [] } as NodeObj;
     const start = lineStart(text, startOf(md));
     const info: SourceInfo = {
       id: node.id,
-      kind: item.type === 'heading' ? 'heading' : item.type === 'list' ? 'listGroup' : 'block',
+      kind: item.type === 'heading' ? 'heading' : 'block',
       parentId: parent.id,
       children: [],
       start,
@@ -589,22 +703,60 @@ function treeToMindElixir(ctx: Ctx, items: TreeItem[], parent: SourceInfo, path:
     };
     nodes.push(node);
 
-    if (item.type === 'list') {
-      node.topic = 'List';
-      ctx.nodes.set(info.id, info);
-      node.children = processList(ctx, md as List, info, childPath);
-    } else {
+    {
       if (item.type === 'heading') {
         info.depth = (md as Heading).depth;
         info.atx = /^ {0,3}#/.test(text.slice(start));
         info.end = sectionEnd(ctx, md as Heading);
       }
       fillNode(ctx, node, info, md, md);
+
+      // Table / code / image block: `<!-- mindmap:node id=x -->` right after it gives an ID,
+      // and an *indented* list right after it holds its children.
+      let after = ctx.nextOf.get(md);
+      let blockChildren: List | undefined;
+      if (item.type !== 'heading' && item.type !== 'paragraph') {
+        const id = after && ctx.nodeComments.get(after);
+        if (id) {
+          info.ownEnd = info.end = lineEndAfter(text, endOf(after));
+          const anchored = `ref-${id}`;
+          if (!ctx.anchors.has(id) && !ctx.nodes.has(anchored)) node.id = info.id = anchored;
+          if (registerAnchor(ctx, id, node, after)) {
+            info.anchor = id;
+            node.metadata = { ...(node.metadata as object | undefined), refId: id };
+          }
+          after = ctx.nextOf.get(after);
+        }
+        const next = items[i + 1];
+        if (next?.type === 'list' && next.object === after) {
+          // Markdown merges "  - a" and "- b" into one list: only the leading
+          // indented items are the block's children, the rest stay siblings.
+          const list = next.object as List;
+          const indented = (li: ListItem) => startOf(li) > lineStart(text, startOf(li));
+          let k = 0;
+          while (k < list.children.length && indented(list.children[k])) k++;
+          if (k > 0) {
+            blockChildren = { ...list, children: list.children.slice(0, k) } as List;
+            blockChildren.position = {
+              start: list.position!.start,
+              end: list.children[k - 1].position!.end,
+            };
+            if (k < list.children.length) {
+              const rest = { ...list, children: list.children.slice(k) } as List;
+              rest.position = { start: list.children[k].position!.start, end: list.position!.end };
+              items.splice(i + 1, 1, { ...next, object: blockChildren }, { ...next, object: rest });
+            } else {
+              items[i + 1] = { ...next, object: blockChildren };
+            }
+          }
+        }
+      }
       ctx.nodes.set(info.id, info);
 
-      // Merge a following list into the preceding content node
+      // A list right after a paragraph (e.g. "Features:" + list) becomes its children.
+      // Other blocks take only an indented list (see above); a plain list stays a sibling.
       const next = items[i + 1];
-      if (next && next.type === 'list' && item.type !== 'heading') {
+      if (next && next.type === 'list' && (item.type === 'paragraph' || next.object === blockChildren)) {
         node.children = processList(ctx, next.object as List, info, childPath);
         info.end = lineEndAfter(text, endOf(next.object));
         items.splice(i + 1, 1);
@@ -652,6 +804,9 @@ export function markdownToMindElixirData(text: string, options: ConvertOptions):
     issues: [],
     nodes: new Map(),
     summaries: [],
+    summarySources: [],
+    nodeComments: new Map(),
+    nextOf: new Map(),
     headings: [],
   };
   let title = options.title;
@@ -664,6 +819,7 @@ export function markdownToMindElixirData(text: string, options: ConvertOptions):
     if (obj.title) title = obj.title;
   }
 
+  ast.children.forEach((c, i) => ctx.nextOf.set(c, ast.children[i + 1]));
   for (const c of ast.children) {
     if (c.type === 'heading') {
       const s = lineStart(text, startOf(c));
@@ -720,6 +876,7 @@ export function markdownToMindElixirData(text: string, options: ConvertOptions):
     const info = ctx.nodes.get(only.id)!;
     ctx.nodes.delete(only.id);
     for (const s of ctx.summaries) if (s.parent === only.id) s.parent = 'root';
+    for (const s of ctx.summarySources) if (s.parent === only.id) s.parent = 'root';
     for (const a of Array.from(ctx.anchors.values())) if (a.nodeId === only.id) a.nodeId = 'root';
     info.id = 'root';
     info.parentId = null;
@@ -733,6 +890,7 @@ export function markdownToMindElixirData(text: string, options: ConvertOptions):
   }
 
   const { arrows, links } = resolveLinks(ctx);
+  resolveSummaries(ctx);
   const anchors = new Map<string, string>();
   for (const [k, v] of Array.from(ctx.anchors.entries())) anchors.set(k, v.nodeId);
 
@@ -746,6 +904,7 @@ export function markdownToMindElixirData(text: string, options: ConvertOptions):
       text,
       nodes: ctx.nodes,
       links,
+      summaries: ctx.summarySources,
       anchors,
       headings: ctx.headings,
       anchorStyle: usesCaret ? 'caret' : 'brace',

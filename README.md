@@ -30,8 +30,10 @@ Open any Markdown file and click the button in the editor title bar
 | `# Title` (the only h1) | root node (see `h1AsRoot`) |
 | `##`, `###`, … headings | nested branches |
 | paragraph, table, code block | a node under its heading |
-| list items | child nodes (nested lists → deeper levels) |
-| a list right after a paragraph | children of that paragraph |
+| list items | one node per item, direct children of the section (nested lists → deeper levels) |
+| a list right after a paragraph (e.g. `Features:`) | children of that paragraph |
+| several lines of text without `- ` | one node (Markdown joins them into a single paragraph) |
+| a list indented by 2 spaces right after a table / code block | children of that table / code block |
 | a document that is one big list | its single top-level item is the root |
 
 ## Links Between Nodes
@@ -58,6 +60,21 @@ Give a heading, paragraph or list item an ID by appending `{#id}` or `[^id]`
 | `<!-- mindmap:link from=a to=b label="x" -->` | link as an HTML comment — invisible in rendered Markdown |
 | `bidirectional`, `delta1="10,-20"`, `delta2="30,5"` | extra attributes of the comment form |
 
+Tables, code blocks and images get an ID with a comment right after them (invisible when rendered);
+their children are an **indented** list below it — a list without indentation stays a sibling:
+
+```markdown
+| packet | tag  |
+|--------|------|
+| SEAL   | 0x11 |
+<!-- mindmap:node id=packets -->
+
+  - child of the table
+  - another child
+
+- a sibling of the table
+```
+
 - IDs may contain letters of any alphabet, digits, `_` and `-`.
 - IDs survive editing the text or moving lines around.
 - A link can be declared anywhere in the file, also as a list item: `- > [^a] >-label-> [^b]`.
@@ -72,7 +89,9 @@ Every change on the map is turned into a minimal edit of the affected lines of t
 | Rename a node (double-click / `F2`) | only the text changes; `{#id}`, styles and markers stay |
 | Delete a node (`Delete`) | its lines (with children) and the links pointing to it |
 | Move a node (drag & drop, `PgUp` / `PgDn`) | its lines are moved; heading levels and list indentation are adjusted |
-| Create a link (node context menu → Link) | one link line; missing IDs are added to the nodes automatically |
+| Add a parent (context menu) | a heading above it (the section moves one level down) or a list item above it (the item is indented) |
+| Create a link (node context menu → Link) | one link line; missing IDs are added to the nodes automatically (`<!-- mindmap:node id=… -->` for tables) |
+| Summary / «Описание» (select siblings → context menu) | `<!-- mindmap:summary from=a to=b label="…" -->`, or `- }:2 label` for nested list items |
 | Right-click a link | edit label, make one-way / two-way, reset curve, delete |
 | Drag a link's line (or its handles) | the curve is saved as coordinates in the link line |
 | `Ctrl+Z` / `Ctrl+Y` on the map | undo / redo in the text editor |
@@ -80,8 +99,9 @@ Every change on the map is turned into a minimal edit of the affected lines of t
 The file is saved after a map change (unless it already had unsaved changes).
 
 Not supported for Markdown yet — the map shows a warning and reloads from the file:
-insert parent, copy nodes, creating summaries, node styles. Tables, code blocks and other
-non-text blocks are shown but cannot be edited on the map.
+copy / paste of nodes and node styles. The content of tables and code blocks is edited in the text
+editor (on the map they can get children, links and summaries, be moved and deleted).
+A parent can be added to a paragraph or table only when it is the last block before the next heading.
 
 ### Mind Elixir plaintext files
 

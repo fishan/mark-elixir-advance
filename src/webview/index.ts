@@ -188,12 +188,31 @@ mind.bus.addListener('operation', (op: any) => {
     case 'finishEditArrowLabel':
       send({ type: 'updateArrow', id: op.obj.id, label: op.obj.label });
       break;
-    case 'insertParent':
+    case 'insertParent': {
+      const child = op.obj.children?.[0];
+      if (!child) return;
+      send({ type: 'insertParent', node: { id: child.id }, topic: op.obj.topic });
+      break;
+    }
+    case 'createSummary':
+    case 'finishEditSummary': {
+      const sum = op.obj;
+      const parent = nodeById(sum.parent);
+      send({
+        type: op.name === 'createSummary' ? 'createSummary' : 'updateSummary',
+        id: sum.id,
+        parent: parent ? ref(parent) : { id: sum.parent },
+        start: sum.start,
+        end: sum.end,
+        label: sum.label ?? '',
+      });
+      break;
+    }
+    case 'removeSummary':
+      send({ type: 'removeSummary', id: op.obj.id });
+      break;
     case 'copyNode':
     case 'copyNodes':
-    case 'createSummary':
-    case 'removeSummary':
-    case 'finishEditSummary':
     case 'reshapeNode':
       send({ type: 'unsupported', name: op.name });
       break;

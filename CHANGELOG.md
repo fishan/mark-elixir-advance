@@ -11,6 +11,9 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 - The map is always editable: add, rename, delete and move nodes, create links. Each map change edits only the affected lines of the Markdown file (heading levels and list indentation are adjusted on move).
 - Link context menu (edit label, one-way / two-way, reset curve, delete) and dragging a link's line to bend it.
 - Unknown / duplicate link IDs are reported in the Problems panel.
+- Tables, code blocks and images are full map nodes: ID via `<!-- mindmap:node id=… -->`, children as an indented list below them, links and summaries.
+- List items are direct children of their section (no synthetic "List" node); only a paragraph takes a following list as its children.
+- "Add parent" and summaries («Описание») work on the map and are written to the file (`<!-- mindmap:summary from=a to=b label="…" -->` or `- }:N label`).
 - `Ctrl+Z` / `Ctrl+Y` on the map undo / redo in the text editor.
 - Fix: a Markdown file starting with a list was treated as Mind Elixir plaintext and the whole file was rewritten on any map change (tables and other content were lost). The separate plaintext mode is removed; plaintext files are parsed as Markdown.
 - Fix: arrows in plaintext files were dropped when the map was opened.

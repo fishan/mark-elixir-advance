@@ -13,6 +13,7 @@ import {
   type LinkSource,
   type SourceInfo,
   type SourceMap,
+  type SummarySource,
 } from './markdownConverter';
 
 // ─── Operations sent by the webview ──────────────────────────────────────────
@@ -27,6 +28,7 @@ export type Delta = { x: number; y: number };
 
 export type MapOp =
   | { type: 'insert'; parent: NodeRef; index: number; topic: string }
+  | { type: 'insertParent'; node: NodeRef; topic: string }
   | { type: 'edit'; node: NodeRef; topic: string }
   | { type: 'remove'; ids: string[] }
   | { type: 'move'; ids: string[]; parent: NodeRef; index: number }
@@ -41,6 +43,9 @@ export type MapOp =
       delta2?: Delta;
       resetDeltas?: boolean;
     }
+  | { type: 'createSummary'; parent: NodeRef; start: number; end: number; label: string }
+  | { type: 'updateSummary'; id: string; parent?: NodeRef; start?: number; end?: number; label: string }
+  | { type: 'removeSummary'; id: string; parent?: NodeRef; start?: number; end?: number }
   | { type: 'unsupported'; name: string };
 
 /**
@@ -182,7 +187,7 @@ interface Placement {
 }
 
 const kindOf = (n: SourceInfo): BlockKind | 'root' =>
-  n.kind === 'listGroup' ? 'block' : n.kind === 'root' ? 'root' : n.kind;
+  n.kind === 'root' ? 'root' : n.kind;
 
 function childHeadingDepth(sm: SourceMap, parent: SourceInfo, siblings: SourceInfo[]): number {
   const sib = siblings.find((s) => s.kind === 'heading');
@@ -234,7 +239,12 @@ function place(
   };
 
   if (prev || next) {
-    const p = (prev && fromRef(prev, 'after')) || (next && fromRef(next, 'before'));
+    // A new node next to a list becomes a list item: a paragraph placed right
+    // before a list would take that list as its children.
+    const preferNext = !hint && next?.kind === 'listItem' && prev?.kind !== 'listItem';
+    const p = preferNext
+      ? fromRef(next!, 'before')
+      : (prev && fromRef(prev, 'after')) || (next && fromRef(next, 'before'));
     if (p) return p;
     return 'This position mixes different kinds of Markdown elements (headings, paragraphs, list items).';
   }
@@ -253,9 +263,14 @@ function place(
     case 'listItem':
       if (hint && hint !== 'listItem') return 'Only list items can be placed under a list item.';
       return { offset: parent.end, kind: 'listItem', indent: childIndentOf(parent), marker: '- ' };
-    case 'block':
-      if (hint && hint !== 'listItem') return 'Only list items can be placed under a paragraph.';
-      return { offset: parent.end, kind: 'block', indent: '', marker: '- ' }; // a new list
+    case 'block': {
+      // children of a paragraph: a list right after it; of a table / code block: an indented list
+      const textual = parent.contentStart !== undefined;
+      if (hint && hint !== 'listItem') {
+        return textual ? 'Only list items can be placed under a paragraph.' : 'Only list items can be placed under a table or code block.';
+      }
+      return { offset: parent.end, kind: 'block', indent: textual ? '' : '  ', marker: '- ' }; // a new list
+    }
     case 'root':
       if (hint === 'heading') return { offset: parent.end, kind: 'heading', depth: sm.h1AsRoot ? 2 : 1 };
       if (hint === 'block') return { offset: parent.end, kind: 'block' };
@@ -268,7 +283,7 @@ function place(
 function renderNew(text: string, p: Placement, topic: string): Edit {
   if (p.kind === 'heading') return blockInsert(text, p.offset, '#'.repeat(p.depth ?? 2) + ' ' + oneLine(topic));
   if (p.kind === 'listItem') return lineInsert(text, p.offset, listLine(p.indent ?? '', p.marker ?? '- ', topic));
-  if (p.marker) return blockInsert(text, p.offset, listLine('', p.marker, topic)); // new list after paragraph
+  if (p.marker) return blockInsert(text, p.offset, listLine(p.indent ?? '', p.marker, topic)); // new list after a block
   return blockInsert(text, p.offset, topic);
 }
 
@@ -330,6 +345,13 @@ function removeNodes(sm: SourceMap, op: Extract<MapOp, { type: 'remove' }>): Edi
   for (const l of linksTouching(sm, all)) {
     if (top.some((n) => n!.start <= l.removeStart && l.removeEnd <= n!.end)) continue;
     edits.push(linkDeletion(sm, l));
+  }
+  // …and summaries anchored to deleted nodes
+  for (const s of sm.summaries) {
+    if (s.form !== 'comment') continue;
+    if (!all.has(sm.anchors.get(s.from ?? '') ?? '') && !all.has(sm.anchors.get(s.to ?? '') ?? '')) continue;
+    if (top.some((n) => n!.start <= s.removeStart && s.removeEnd <= n!.end)) continue;
+    edits.push(summaryDeletion(sm, s));
   }
   return applyEdits(sm.text, mergeEdits(edits));
 }
@@ -467,29 +489,60 @@ function slugify(topic: string): string {
   return s || 'node';
 }
 
+/**
+ * Make sure a node has a Markdown ID; returns it, adding the edit that writes it:
+ * ` {#id}` / ` [^id]` after the text, or `<!-- mindmap:node id=… -->` after a table / code block.
+ */
+function ensureAnchor(
+  sm: SourceMap,
+  n: SourceInfo,
+  edits: Edit[],
+  used: Set<string>,
+  added: Map<string, string>
+): string | { error: string } {
+  if (n.anchor) return n.anchor;
+  const done = added.get(n.id);
+  if (done) return done;
+  const textual = n.contentStart !== undefined && n.contentEnd !== undefined;
+  if (!textual && n.kind !== 'block') {
+    return { error: 'This node has no text in the Markdown source to attach an ID to.' };
+  }
+  const base = textual
+    ? slugify(sm.text.slice(n.contentStart, n.contentEnd))
+    : slugify(sm.text.slice(n.start, lineEndAfter(sm.text, n.start + 1)));
+  let id = base;
+  for (let i = 2; used.has(id); i++) id = `${base}-${i}`;
+  used.add(id);
+  added.set(n.id, id);
+  if (textual) {
+    edits.push({ start: n.contentEnd!, end: n.contentEnd!, text: sm.anchorStyle === 'caret' ? ` [^${id}]` : ` {#${id}}` });
+  } else {
+    edits.push(blockInsert(sm.text, n.ownEnd, `<!-- mindmap:node id=${id} -->`));
+  }
+  return id;
+}
+
+/** Where a new `<!-- mindmap:… -->` declaration goes: after the last one, else at the end of the file. */
+function appendComment(sm: SourceMap, line: string): Edit {
+  const decls = [
+    ...sm.links.filter((l) => l.form === 'comment' && l.block && !l.listItem),
+    ...sm.summaries.filter((s) => s.form === 'comment' && s.block),
+  ].sort((a, b) => a.nodeEnd - b.nodeEnd);
+  const last = decls[decls.length - 1];
+  if (last) return lineInsert(sm.text, lineEndAfter(sm.text, last.nodeEnd), line);
+  return blockInsert(sm.text, sm.text.length, line);
+}
+
 function createArrow(sm: SourceMap, op: Extract<MapOp, { type: 'createArrow' }>): EditResult {
   const from = resolve(sm, op.from);
   const to = resolve(sm, op.to);
   if (!from || !to) return { error: 'Node not found (the map may be out of date).' };
   const edits: Edit[] = [];
   const used = new Set(sm.anchors.keys());
-  const anchorOf = (n: SourceInfo): string | { error: string } => {
-    if (n.anchor) return n.anchor;
-    if (n.contentEnd === undefined) {
-      return { error: 'This node has no text in the Markdown source to attach an ID to.' };
-    }
-    const existing = edits.find((e) => e.start === n.contentEnd);
-    if (existing) return existing.text.match(/[\p{L}\p{N}_-]+/u)![0];
-    const topic = sm.text.slice(n.contentStart, n.contentEnd);
-    let id = slugify(topic);
-    for (let i = 2; used.has(id); i++) id = `${slugify(topic)}-${i}`;
-    used.add(id);
-    edits.push({ start: n.contentEnd, end: n.contentEnd, text: sm.anchorStyle === 'caret' ? ` [^${id}]` : ` {#${id}}` });
-    return id;
-  };
-  const a = anchorOf(from);
+  const added = new Map<string, string>();
+  const a = ensureAnchor(sm, from, edits, used, added);
   if (typeof a !== 'string') return a;
-  const b = anchorOf(to);
+  const b = ensureAnchor(sm, to, edits, used, added);
   if (typeof b !== 'string') return b;
 
   const decl = { from: a, to: b, label: op.label ?? '', bidirectional: !!op.bidirectional };
@@ -498,15 +551,13 @@ function createArrow(sm: SourceMap, op: Extract<MapOp, { type: 'createArrow' }>)
   if (last?.listItem) {
     const line = last.listItem.indent + last.listItem.marker + renderLink({ ...decl, form: last.form });
     edits.push(lineInsert(sm.text, last.listItem.end, line));
-  } else if (last?.block) {
-    const line = renderLink({ ...decl, form: last.form });
-    const at = lineEndAfter(sm.text, last.nodeEnd);
-    edits.push(last.form === 'comment' ? lineInsert(sm.text, at, line) : blockInsert(sm.text, at, line));
-  } else if (root.kind === 'listItem') {
+  } else if (last?.block && last.form === 'blockquote') {
+    edits.push(blockInsert(sm.text, lineEndAfter(sm.text, last.nodeEnd), renderLink({ ...decl, form: 'blockquote' })));
+  } else if (!last && root.kind === 'listItem') {
     // one-big-list document: keep it a pure list (Mind Elixir plaintext style)
     edits.push(lineInsert(sm.text, root.end, childIndentOf(root) + '- ' + renderLink({ ...decl, form: 'blockquote' })));
   } else {
-    edits.push(blockInsert(sm.text, sm.text.length, renderLink({ ...decl, form: 'comment' })));
+    edits.push(appendComment(sm, renderLink({ ...decl, form: 'comment' })));
   }
   return applyEdits(sm.text, edits);
 }
@@ -530,15 +581,132 @@ function removeArrow(sm: SourceMap, op: Extract<MapOp, { type: 'removeArrow' }>)
   return applyEdits(sm.text, [linkDeletion(sm, l)]);
 }
 
+// ─── Summaries ("Описание") ──────────────────────────────────────────────────
+
+const quoteAttr = (s: string) => {
+  const v = s.replace(/--/g, '- -');
+  return v.includes('"') ? `'${v.replace(/'/g, '’')}'` : `"${v}"`;
+};
+
+function renderSummary(s: Pick<SummarySource, 'form' | 'from' | 'to' | 'label' | 'count'>): string {
+  if (s.form === 'item') return `}${s.count ? `:${s.count}` : ''} ${s.label}`.trimEnd();
+  return `<!-- mindmap:summary from=${s.from} to=${s.to}${s.label ? ` label=${quoteAttr(s.label)}` : ''} -->`;
+}
+
+function summaryDeletion(sm: SourceMap, s: SummarySource): Edit {
+  if (s.form === 'item' || !s.block) return { start: s.removeStart, end: s.removeEnd, text: '' };
+  return blockDelete(sm.text, s.removeStart, s.removeEnd);
+}
+
+function findSummary(sm: SourceMap, op: { id: string; parent?: NodeRef; start?: number; end?: number }) {
+  const byId = sm.summaries.find((s) => s.summaryId === op.id);
+  if (byId) return byId;
+  // created on the map moments ago (random id): match by position
+  const parent = resolve(sm, op.parent);
+  return sm.summaries.find((s) => s.parent === parent?.id && s.start === op.start && s.end === op.end);
+}
+
+function createSummary(sm: SourceMap, op: Extract<MapOp, { type: 'createSummary' }>): EditResult {
+  const parent = resolve(sm, op.parent);
+  if (!parent) return { error: 'Node not found (the map may be out of date).' };
+  const sibs = parent.children.map((id) => sm.nodes.get(id)!);
+  const start = Math.max(0, Math.min(op.start, op.end));
+  const end = Math.min(sibs.length - 1, Math.max(op.start, op.end));
+  if (end < start || !sibs[start]) return { error: 'Nothing to summarize.' };
+  const range = sibs.slice(start, end + 1);
+  const last = range[range.length - 1];
+
+  // Nested list items (under a list item, paragraph or table): native `- }:N label` right after them
+  if (range.every((n) => n.kind === 'listItem') && (parent.kind === 'listItem' || parent.kind === 'block')) {
+    const line = `${last.indent ?? ''}- ${renderSummary({ form: 'item', label: op.label, count: range.length })}`;
+    return applyEdits(sm.text, [lineInsert(sm.text, last.end, line)]);
+  }
+  const edits: Edit[] = [];
+  const used = new Set(sm.anchors.keys());
+  const added = new Map<string, string>();
+  const a = ensureAnchor(sm, range[0], edits, used, added);
+  if (typeof a !== 'string') return a;
+  const b = ensureAnchor(sm, last, edits, used, added);
+  if (typeof b !== 'string') return b;
+  edits.push(appendComment(sm, renderSummary({ form: 'comment', from: a, to: b, label: op.label })));
+  return applyEdits(sm.text, edits);
+}
+
+function updateSummary(sm: SourceMap, op: Extract<MapOp, { type: 'updateSummary' }>): EditResult {
+  const s = findSummary(sm, op);
+  if (!s) return { error: 'Summary not found in the Markdown source (the map may be out of date).' };
+  return applyEdits(sm.text, [{ start: s.nodeStart, end: s.nodeEnd, text: renderSummary({ ...s, label: op.label }) }]);
+}
+
+function removeSummary(sm: SourceMap, op: Extract<MapOp, { type: 'removeSummary' }>): EditResult {
+  const s = findSummary(sm, op);
+  if (!s) return { error: 'Summary not found in the Markdown source (the map may be out of date).' };
+  return applyEdits(sm.text, [summaryDeletion(sm, s)]);
+}
+
+// ─── Insert parent ───────────────────────────────────────────────────────────
+
+function insertParent(sm: SourceMap, op: Extract<MapOp, { type: 'insertParent' }>): EditResult {
+  const n = resolve(sm, op.node);
+  if (!n || !n.parentId) return { error: 'Node not found (the map may be out of date).' };
+  const topic = op.topic || 'New Node';
+  const nl = eolOf(sm.text);
+
+  if (n.kind === 'heading') {
+    const inner = sm.headings.filter((h) => h.start >= n.start && h.start < n.end);
+    if (inner.some((h) => !h.atx)) return { error: 'Setext headings (underlined with ===) cannot be re-leveled.' };
+    if (inner.some((h) => h.depth >= 6)) return { error: 'Headings cannot be nested deeper than level 6.' };
+    const edits: Edit[] = inner.map((h) => {
+      const m = sm.text.slice(h.start).match(/^( {0,3})(#{1,6})/)!;
+      return { start: h.start + m[1].length, end: h.start + m[0].length, text: '#'.repeat(h.depth + 1) };
+    });
+    // the new heading goes before the (re-leveled) first heading line
+    const first = edits[0];
+    first.text = '#'.repeat(n.depth!) + ' ' + oneLine(topic) + nl + nl + first.text;
+    return applyEdits(sm.text, edits);
+  }
+
+  if (n.kind === 'listItem') {
+    const pad = ' '.repeat((n.marker ?? '- ').length);
+    const edits: Edit[] = [];
+    let ls = n.start;
+    let firstLine = true;
+    while (ls < n.end) {
+      const next = lineEndAfter(sm.text, ls + 1);
+      if (firstLine) {
+        edits.push({ start: ls, end: ls, text: listLine(n.indent ?? '', n.marker ?? '- ', topic) + nl + pad });
+        firstLine = false;
+      } else if (!isBlankLine(sm.text, ls)) {
+        edits.push({ start: ls, end: ls, text: pad });
+      }
+      if (next <= ls) break;
+      ls = next;
+    }
+    return applyEdits(sm.text, edits);
+  }
+
+  // Paragraph / table / code under a heading: a new heading in front of it works only
+  // if nothing but headings follows it (otherwise the new section would swallow them).
+  const parent = sm.nodes.get(n.parentId)!;
+  const sibs = parent.children.map((id) => sm.nodes.get(id)!);
+  const after = sibs.slice(sibs.indexOf(n) + 1);
+  if ((parent.kind === 'heading' || parent.kind === 'root') && after.every((s) => s.kind === 'heading')) {
+    const depth = parent.kind === 'heading' ? (parent.depth ?? 1) + 1 : sm.h1AsRoot ? 2 : 1;
+    const d = after.find((s) => s.kind === 'heading')?.depth ?? depth;
+    if (d > 6) return { error: 'Headings cannot be nested deeper than level 6.' };
+    return applyEdits(sm.text, [blockInsert(sm.text, n.start, '#'.repeat(d) + ' ' + oneLine(topic))]);
+  }
+  return {
+    error:
+      'A parent can be added to headings and list items. For a paragraph or table it works only when it is the last block before the next heading.',
+  };
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 const UNSUPPORTED: Record<string, string> = {
-  insertParent: 'Inserting a parent node',
   copyNode: 'Copying nodes',
   copyNodes: 'Copying nodes',
-  createSummary: 'Summaries',
-  removeSummary: 'Summaries',
-  finishEditSummary: 'Summaries',
   reshapeNode: 'Node styles',
 };
 
@@ -546,6 +714,8 @@ export function applyMapOp(sm: SourceMap, op: MapOp): EditResult {
   switch (op.type) {
     case 'insert':
       return insertNode(sm, op);
+    case 'insertParent':
+      return insertParent(sm, op);
     case 'edit':
       return editNode(sm, op);
     case 'remove':
@@ -558,6 +728,12 @@ export function applyMapOp(sm: SourceMap, op: MapOp): EditResult {
       return updateArrow(sm, op);
     case 'removeArrow':
       return removeArrow(sm, op);
+    case 'createSummary':
+      return createSummary(sm, op);
+    case 'updateSummary':
+      return updateSummary(sm, op);
+    case 'removeSummary':
+      return removeSummary(sm, op);
     case 'unsupported':
       return { error: `${UNSUPPORTED[op.name] ?? `"${op.name}"`} is not supported for Markdown files yet.` };
   }
